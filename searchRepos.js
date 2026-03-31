@@ -13,14 +13,34 @@ if (!token || token === 'your-github-token-here') {
   process.exit(1);
 }
 
-// Create output directory with timestamp
-const runTimestamp = new Date().toISOString().replace(/:/g, '-');
-const outputDir = path.join(__dirname, 'results', runTimestamp);
-fs.mkdirSync(outputDir, { recursive: true });
+const checkpointDir = path.join(__dirname, 'checkpoints');
+const resultsDir = path.join(__dirname, 'results');
+fs.mkdirSync(checkpointDir, { recursive: true });
+fs.mkdirSync(resultsDir, { recursive: true });
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+// --- Checkpoint helpers ---
+
+function getCheckpointPath(lang, lo, hi) {
+  return path.join(checkpointDir, `${lang}_stars-${lo}-${hi}.json`);
+}
+
+function checkpointExists(filepath) {
+  return fs.existsSync(filepath);
+}
+
+function readCheckpoint(filepath) {
+  return JSON.parse(fs.readFileSync(filepath, 'utf-8'));
+}
+
+function writeCheckpoint(filepath, data) {
+  fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
+}
+
+// --- API helpers ---
 
 async function apiFetch(url) {
   const response = await fetch(url, {
@@ -107,6 +127,67 @@ async function buildStarRanges(language, starMin, starMax) {
   return ranges;
 }
 
+// ======================================================================
+// STEP 1: FETCH — download all repos, save raw data to checkpoint files
+// ======================================================================
+
+async function stepFetch() {
+  console.log('=== STEP 1: FETCH ===\n');
+
+  for (const lang of languages) {
+    console.log(`[${lang}] Checking counts and splitting ranges...`);
+    const ranges = await buildStarRanges(lang, minStars, maxStars);
+    console.log(`[${lang}] ${ranges.length} range(s): ${ranges.map(r => `${r.lo}..${r.hi}(${r.count})`).join(', ')}\n`);
+
+    for (const range of ranges) {
+      if (range.count === 0) continue;
+
+      const cpPath = getCheckpointPath(lang, range.lo, range.hi);
+
+      // Resume: skip if already fetched
+      if (checkpointExists(cpPath)) {
+        const existing = readCheckpoint(cpPath);
+        console.log(`  [${lang}] stars:${range.lo}..${range.hi} — SKIPPED (already fetched ${existing.repos.length} repos)`);
+        continue;
+      }
+
+      console.log(`  [${lang}] Fetching stars:${range.lo}..${range.hi} (${range.count} repos)...`);
+      const repos = await fetchAllPages(range.query);
+
+      // Save raw repo data to checkpoint
+      const checkpoint = {
+        language: lang,
+        starRange: `${range.lo}..${range.hi}`,
+        query: range.query,
+        totalInRange: range.count,
+        fetchedAt: new Date().toISOString(),
+        repos: repos.map(r => ({
+          id: r.id,
+          repo: r.full_name,
+          url: r.html_url,
+          about: r.description || '(no description)',
+          stars: r.stargazers_count,
+          forks: r.forks_count,
+          language: r.language,
+          topics: r.topics || [],
+          createdAt: r.created_at,
+          lastUpdated: r.updated_at,
+          license: r.license ? r.license.spdx_id : null,
+        })),
+      };
+
+      writeCheckpoint(cpPath, checkpoint);
+      console.log(`  💾 Checkpoint saved: ${path.basename(cpPath)} (${repos.length} repos)\n`);
+    }
+  }
+
+  console.log('FETCH complete.\n');
+}
+
+// ======================================================================
+// STEP 2: FILTER — read checkpoints, check contributors & issues, save
+// ======================================================================
+
 async function getContributorsCount(repoFullName) {
   const url = `https://api.github.com/repos/${repoFullName}/contributors?per_page=100`;
   const data = await apiFetch(url);
@@ -122,149 +203,174 @@ async function getRecentOpenIssues(repoFullName) {
   return Array.isArray(data) && data.length > 0;
 }
 
-// Save one file per fetch chunk (language + star range)
-function saveChunkFile(lang, range, repos, filtered) {
-  const filename = `${lang}_stars-${range.lo}-${range.hi}.json`;
-  const filepath = path.join(outputDir, filename);
+async function stepFilter() {
+  console.log('=== STEP 2: FILTER ===\n');
 
+  // Find all fetch checkpoint files
+  const cpFiles = fs.readdirSync(checkpointDir)
+    .filter(f => f.endsWith('.json') && !f.includes('_filtered'));
+
+  const seen = new Set(); // global dedup
+
+  for (const cpFile of cpFiles) {
+    const cpPath = path.join(checkpointDir, cpFile);
+    const filteredPath = cpPath.replace('.json', '_filtered.json');
+
+    const checkpoint = readCheckpoint(cpPath);
+
+    // Resume: if already fully filtered, skip
+    if (checkpointExists(filteredPath)) {
+      const existing = readCheckpoint(filteredPath);
+      if (existing.completed) {
+        console.log(`[${checkpoint.language}] ${checkpoint.starRange} — SKIPPED (already filtered, ${existing.results.length} matched)`);
+        existing.results.forEach(r => seen.add(r.repo));
+        continue;
+      }
+    }
+
+    // Load partial progress if exists
+    let filtered = [];
+    let startIndex = 0;
+    if (checkpointExists(filteredPath)) {
+      const partial = readCheckpoint(filteredPath);
+      filtered = partial.results || [];
+      startIndex = partial.processedCount || 0;
+      filtered.forEach(r => seen.add(r.repo));
+      console.log(`[${checkpoint.language}] ${checkpoint.starRange} — RESUMING from repo ${startIndex + 1}/${checkpoint.repos.length}`);
+    } else {
+      console.log(`[${checkpoint.language}] ${checkpoint.starRange} — Filtering ${checkpoint.repos.length} repos...`);
+    }
+
+    const repos = checkpoint.repos;
+
+    for (let i = startIndex; i < repos.length; i++) {
+      const repo = repos[i];
+
+      // Dedup across chunks
+      if (seen.has(repo.repo)) {
+        process.stdout.write(`    [${i + 1}/${repos.length}] ${repo.repo} ... ✗ duplicate\n`);
+        continue;
+      }
+      seen.add(repo.repo);
+
+      process.stdout.write(`    [${i + 1}/${repos.length}] ${repo.repo} ... `);
+
+      const contributorsCount = await getContributorsCount(repo.repo);
+
+      if (contributorsCount > 2) {
+        const hasRecentOpenIssues = await getRecentOpenIssues(repo.repo);
+
+        if (hasRecentOpenIssues) {
+          filtered.push({
+            ...repo,
+            contributors: contributorsCount,
+            hasRecentOpenIssues: true,
+          });
+          console.log(`✓ MATCH (${contributorsCount} contributors)`);
+        } else {
+          console.log(`✗ no recent issues`);
+        }
+      } else {
+        console.log(`✗ ${contributorsCount} contributors`);
+      }
+
+      // Save progress every 10 repos
+      if (i % 10 === 9) {
+        writeCheckpoint(filteredPath, {
+          language: checkpoint.language,
+          starRange: checkpoint.starRange,
+          processedCount: i + 1,
+          totalCount: repos.length,
+          completed: false,
+          results: filtered,
+        });
+      }
+
+      if (i % 5 === 4) await sleep(500);
+    }
+
+    // Mark as completed
+    writeCheckpoint(filteredPath, {
+      language: checkpoint.language,
+      starRange: checkpoint.starRange,
+      processedCount: repos.length,
+      totalCount: repos.length,
+      completed: true,
+      results: filtered,
+    });
+
+    console.log(`  💾 Filtered: ${filtered.length} matched out of ${repos.length}\n`);
+  }
+
+  console.log('FILTER complete.\n');
+}
+
+// ======================================================================
+// STEP 3: EXPORT — combine all filtered results into final output
+// ======================================================================
+
+function stepExport() {
+  console.log('=== STEP 3: EXPORT ===\n');
+
+  const filteredFiles = fs.readdirSync(checkpointDir)
+    .filter(f => f.includes('_filtered.json'));
+
+  const allResults = [];
+  const seen = new Set();
+
+  for (const f of filteredFiles) {
+    const data = readCheckpoint(path.join(checkpointDir, f));
+    for (const repo of (data.results || [])) {
+      if (!seen.has(repo.repo)) {
+        seen.add(repo.repo);
+        allResults.push(repo);
+      }
+    }
+  }
+
+  const timestamp = new Date().toISOString().replace(/:/g, '-');
   const output = {
     searchInfo: {
-      language: lang,
-      starRange: `${range.lo}..${range.hi}`,
-      query: range.query,
-      totalInRange: range.count,
-      fetchedCount: repos.length,
-      matchedCount: filtered.length,
-      fetchedAt: new Date().toISOString(),
+      languages: languages,
+      starRange: `${minStars}..${maxStars}`,
+      exportedAt: new Date().toISOString(),
+      totalMatched: allResults.length,
       filters: {
         minContributors: 3,
         requireRecentOpenIssues: true,
         recentIssueWindow: '1 month',
       },
     },
-    results: filtered,
+    results: allResults,
   };
 
+  const filename = `${timestamp}.json`;
+  const filepath = path.join(resultsDir, filename);
   fs.writeFileSync(filepath, JSON.stringify(output, null, 2));
-  console.log(`  💾 Saved ${filtered.length} results → ${filename}`);
-  return filepath;
+
+  console.log(`Exported ${allResults.length} repos → results/${filename}`);
 }
 
-async function filterRepos(repos) {
-  const results = [];
-
-  for (let i = 0; i < repos.length; i++) {
-    const repo = repos[i];
-    process.stdout.write(`    [${i + 1}/${repos.length}] ${repo.full_name} ... `);
-
-    const contributorsCount = await getContributorsCount(repo.full_name);
-
-    if (contributorsCount > 2) {
-      const hasRecentOpenIssues = await getRecentOpenIssues(repo.full_name);
-
-      if (hasRecentOpenIssues) {
-        results.push({
-          repo: repo.full_name,
-          url: repo.html_url,
-          about: repo.description || '(no description)',
-          stars: repo.stargazers_count,
-          forks: repo.forks_count,
-          language: repo.language,
-          topics: repo.topics || [],
-          contributors: contributorsCount,
-          hasRecentOpenIssues: true,
-          createdAt: repo.created_at,
-          lastUpdated: repo.updated_at,
-          license: repo.license ? repo.license.spdx_id : null,
-        });
-        console.log(`✓ MATCH (${contributorsCount} contributors)`);
-      } else {
-        console.log(`✗ no recent issues`);
-      }
-    } else {
-      console.log(`✗ ${contributorsCount} contributors`);
-    }
-
-    if (i % 5 === 4) await sleep(500);
-  }
-
-  return results;
-}
+// ======================================================================
+// MAIN
+// ======================================================================
 
 async function main() {
   const startTime = new Date();
   console.log('=== GitHub Repo Finder ===');
   console.log(`Languages: ${languages.join(', ')}`);
   console.log(`Stars: ${minStars}..${maxStars}`);
-  console.log(`Output: ${outputDir}`);
+  console.log(`Checkpoints: ${checkpointDir}`);
   console.log(`Started: ${startTime.toISOString()}\n`);
 
-  const allSavedFiles = [];
-  let totalFetched = 0;
-  let totalMatched = 0;
-  const seen = new Set(); // global dedup across all chunks
+  await stepFetch();
+  await stepFilter();
+  stepExport();
 
-  for (const lang of languages) {
-    console.log(`\n[${lang}] Checking counts and splitting ranges...`);
-    const ranges = await buildStarRanges(lang, minStars, maxStars);
-
-    console.log(`[${lang}] ${ranges.length} range(s): ${ranges.map(r => `${r.lo}..${r.hi}(${r.count})`).join(', ')}`);
-
-    for (const range of ranges) {
-      if (range.count === 0) continue;
-
-      console.log(`\n  [${lang}] Fetching stars:${range.lo}..${range.hi} (${range.count} repos)...`);
-      const repos = await fetchAllPages(range.query);
-
-      // Deduplicate
-      const uniqueRepos = repos.filter(repo => {
-        if (seen.has(repo.id)) return false;
-        seen.add(repo.id);
-        return true;
-      });
-
-      console.log(`  [${lang}] ${uniqueRepos.length} unique repos, filtering...\n`);
-      totalFetched += uniqueRepos.length;
-
-      // Filter and save immediately
-      const filtered = await filterRepos(uniqueRepos);
-      totalMatched += filtered.length;
-
-      const savedFile = saveChunkFile(lang, range, uniqueRepos, filtered);
-      allSavedFiles.push(savedFile);
-    }
-  }
-
-  // Save a summary file
   const endTime = new Date();
-  const summary = {
-    searchInfo: {
-      languages: languages,
-      starRange: `${minStars}..${maxStars}`,
-      executedAt: startTime.toISOString(),
-      completedAt: endTime.toISOString(),
-      durationSeconds: Math.round((endTime - startTime) / 1000),
-      totalReposFound: totalFetched,
-      totalReposMatched: totalMatched,
-      chunkFiles: allSavedFiles.map(f => path.basename(f)),
-      filters: {
-        minContributors: 3,
-        requireRecentOpenIssues: true,
-        recentIssueWindow: '1 month',
-      },
-    },
-  };
-
-  const summaryPath = path.join(outputDir, '_summary.json');
-  fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
-
-  console.log(`\n=== Done ===`);
-  console.log(`Total repos searched: ${totalFetched}`);
-  console.log(`Total matched: ${totalMatched}`);
-  console.log(`Duration: ${Math.round((endTime - startTime) / 1000)}s`);
-  console.log(`Files saved to: ${outputDir}`);
+  console.log(`\nTotal duration: ${Math.round((endTime - startTime) / 1000)}s`);
 }
 
 main().catch((error) => {
-  console.error('Error running the script:', error);
+  console.error('Error:', error);
 });
