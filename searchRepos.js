@@ -13,6 +13,11 @@ if (!token || token === 'your-github-token-here') {
   process.exit(1);
 }
 
+// Create output directory with timestamp
+const runTimestamp = new Date().toISOString().replace(/:/g, '-');
+const outputDir = path.join(__dirname, 'results', runTimestamp);
+fs.mkdirSync(outputDir, { recursive: true });
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -43,14 +48,12 @@ async function apiFetch(url) {
   return response.json();
 }
 
-// Get total count for a query without fetching results
 async function getSearchCount(query) {
   const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&per_page=1`;
   const data = await apiFetch(url);
   return data?.total_count || 0;
 }
 
-// Fetch all pages for a query (max 1,000 = 10 pages * 100)
 async function fetchAllPages(query) {
   const allItems = [];
   const perPage = 100;
@@ -74,7 +77,6 @@ async function fetchAllPages(query) {
   return allItems;
 }
 
-// Build star sub-ranges so each chunk has < 1000 results
 async function buildStarRanges(language, starMin, starMax) {
   const baseQuery = `language:${language} is:public archived:false`;
   const ranges = [];
@@ -90,7 +92,6 @@ async function buildStarRanges(language, starMin, starMax) {
       return;
     }
 
-    // Can't split a single star value further
     if (lo === hi) {
       console.log(`    ⚠ stars:${lo} has ${count} repos, can only fetch 1,000`);
       ranges.push({ lo, hi, count, query });
@@ -121,48 +122,40 @@ async function getRecentOpenIssues(repoFullName) {
   return Array.isArray(data) && data.length > 0;
 }
 
-async function main() {
-  const startTime = new Date();
-  console.log('=== GitHub Repo Finder ===');
-  console.log(`Languages: ${languages.join(', ')}`);
-  console.log(`Stars: ${minStars}..${maxStars}`);
-  console.log(`Started: ${startTime.toISOString()}\n`);
+// Save one file per fetch chunk (language + star range)
+function saveChunkFile(lang, range, repos, filtered) {
+  const filename = `${lang}_stars-${range.lo}-${range.hi}.json`;
+  const filepath = path.join(outputDir, filename);
 
-  // Phase 1: For each language, determine star sub-ranges, then fetch
-  const allRepos = [];
-  const rangeDetails = {};
+  const output = {
+    searchInfo: {
+      language: lang,
+      starRange: `${range.lo}..${range.hi}`,
+      query: range.query,
+      totalInRange: range.count,
+      fetchedCount: repos.length,
+      matchedCount: filtered.length,
+      fetchedAt: new Date().toISOString(),
+      filters: {
+        minContributors: 3,
+        requireRecentOpenIssues: true,
+        recentIssueWindow: '1 month',
+      },
+    },
+    results: filtered,
+  };
 
-  for (const lang of languages) {
-    console.log(`\n[${lang}] Checking counts and splitting ranges...`);
-    const ranges = await buildStarRanges(lang, minStars, maxStars);
-    rangeDetails[lang] = ranges;
+  fs.writeFileSync(filepath, JSON.stringify(output, null, 2));
+  console.log(`  💾 Saved ${filtered.length} results → ${filename}`);
+  return filepath;
+}
 
-    console.log(`[${lang}] Will fetch ${ranges.length} range(s): ${ranges.map(r => `${r.lo}..${r.hi}(${r.count})`).join(', ')}`);
-
-    for (const range of ranges) {
-      if (range.count === 0) continue;
-      console.log(`\n  [${lang}] Fetching stars:${range.lo}..${range.hi} (${range.count} repos)...`);
-      const repos = await fetchAllPages(range.query);
-      allRepos.push(...repos);
-    }
-  }
-
-  // Deduplicate by repo id
-  const seen = new Set();
-  const uniqueRepos = allRepos.filter(repo => {
-    if (seen.has(repo.id)) return false;
-    seen.add(repo.id);
-    return true;
-  });
-
-  console.log(`\n--- ${uniqueRepos.length} unique repos found. Filtering by contributors & recent issues ---\n`);
-
-  // Phase 2: Filter
+async function filterRepos(repos) {
   const results = [];
 
-  for (let i = 0; i < uniqueRepos.length; i++) {
-    const repo = uniqueRepos[i];
-    process.stdout.write(`  [${i + 1}/${uniqueRepos.length}] ${repo.full_name} ... `);
+  for (let i = 0; i < repos.length; i++) {
+    const repo = repos[i];
+    process.stdout.write(`    [${i + 1}/${repos.length}] ${repo.full_name} ... `);
 
     const contributorsCount = await getContributorsCount(repo.full_name);
 
@@ -195,36 +188,81 @@ async function main() {
     if (i % 5 === 4) await sleep(500);
   }
 
-  // Build output
+  return results;
+}
+
+async function main() {
+  const startTime = new Date();
+  console.log('=== GitHub Repo Finder ===');
+  console.log(`Languages: ${languages.join(', ')}`);
+  console.log(`Stars: ${minStars}..${maxStars}`);
+  console.log(`Output: ${outputDir}`);
+  console.log(`Started: ${startTime.toISOString()}\n`);
+
+  const allSavedFiles = [];
+  let totalFetched = 0;
+  let totalMatched = 0;
+  const seen = new Set(); // global dedup across all chunks
+
+  for (const lang of languages) {
+    console.log(`\n[${lang}] Checking counts and splitting ranges...`);
+    const ranges = await buildStarRanges(lang, minStars, maxStars);
+
+    console.log(`[${lang}] ${ranges.length} range(s): ${ranges.map(r => `${r.lo}..${r.hi}(${r.count})`).join(', ')}`);
+
+    for (const range of ranges) {
+      if (range.count === 0) continue;
+
+      console.log(`\n  [${lang}] Fetching stars:${range.lo}..${range.hi} (${range.count} repos)...`);
+      const repos = await fetchAllPages(range.query);
+
+      // Deduplicate
+      const uniqueRepos = repos.filter(repo => {
+        if (seen.has(repo.id)) return false;
+        seen.add(repo.id);
+        return true;
+      });
+
+      console.log(`  [${lang}] ${uniqueRepos.length} unique repos, filtering...\n`);
+      totalFetched += uniqueRepos.length;
+
+      // Filter and save immediately
+      const filtered = await filterRepos(uniqueRepos);
+      totalMatched += filtered.length;
+
+      const savedFile = saveChunkFile(lang, range, uniqueRepos, filtered);
+      allSavedFiles.push(savedFile);
+    }
+  }
+
+  // Save a summary file
   const endTime = new Date();
-  const output = {
+  const summary = {
     searchInfo: {
       languages: languages,
       starRange: `${minStars}..${maxStars}`,
       executedAt: startTime.toISOString(),
       completedAt: endTime.toISOString(),
       durationSeconds: Math.round((endTime - startTime) / 1000),
-      totalReposFound: uniqueRepos.length,
-      reposMatchedFilters: results.length,
-      rangeBreakdown: rangeDetails,
+      totalReposFound: totalFetched,
+      totalReposMatched: totalMatched,
+      chunkFiles: allSavedFiles.map(f => path.basename(f)),
       filters: {
         minContributors: 3,
         requireRecentOpenIssues: true,
         recentIssueWindow: '1 month',
       },
     },
-    results: results,
   };
 
-  const timestamp = startTime.toISOString().replace(/:/g, '-');
-  const filename = `${timestamp}.json`;
-  fs.writeFileSync(path.join(__dirname, filename), JSON.stringify(output, null, 2));
+  const summaryPath = path.join(outputDir, '_summary.json');
+  fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
 
   console.log(`\n=== Done ===`);
-  console.log(`Total repos searched: ${uniqueRepos.length}`);
-  console.log(`Repos matched: ${results.length}`);
+  console.log(`Total repos searched: ${totalFetched}`);
+  console.log(`Total matched: ${totalMatched}`);
   console.log(`Duration: ${Math.round((endTime - startTime) / 1000)}s`);
-  console.log(`Saved to: ${filename}`);
+  console.log(`Files saved to: ${outputDir}`);
 }
 
 main().catch((error) => {
