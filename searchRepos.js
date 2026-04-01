@@ -128,7 +128,7 @@ async function getRecentOpenIssues(repoFullName) {
 // --- Process one chunk: fetch → filter → save result ---
 
 async function processChunk(lang, range, seen, targetDir) {
-  console.log(`\n  Fetching stars:${range.stars} (${range.count} repos)...`);
+  console.log(`\n  Fetching stars:${range.stars}...`);
   const repos = await fetchAllPages(range.query);
 
   // Dedup
@@ -232,8 +232,8 @@ async function main() {
   let totalMatched = 0;
 
   for (const lang of languages) {
-    console.log(`[${lang}] Splitting star ranges...`);
-    const ranges = await buildRanges(lang, minStars, maxStars);
+    console.log(`[${lang}] Building star ranges...`);
+    const ranges = buildRanges(lang, minStars, maxStars);
     console.log(`[${lang}] ${ranges.length} range(s)`);
 
     for (const range of ranges) {
