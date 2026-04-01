@@ -68,12 +68,6 @@ async function apiFetch(url) {
   return response.json();
 }
 
-async function getSearchCount(query) {
-  const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&per_page=1`;
-  const data = await apiFetch(url);
-  return data?.total_count || 0;
-}
-
 async function fetchAllPages(query) {
   const allItems = [];
   const perPage = 100;
@@ -97,8 +91,7 @@ async function fetchAllPages(query) {
   return allItems;
 }
 
-async function buildRanges(language, starMin, starMax) {
-  // pushed:>YYYY-MM-DD ensures only repos updated within the last month
+function buildRanges(language, starMin, starMax) {
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
   const pushedSince = oneMonthAgo.toISOString().split('T')[0];
@@ -106,30 +99,12 @@ async function buildRanges(language, starMin, starMax) {
   const baseQuery = `language:${language} is:public archived:false pushed:>${pushedSince}`;
   const ranges = [];
 
-  async function splitByStars(lo, hi) {
-    const query = `stars:${lo}..${hi} ${baseQuery}`;
-    const count = await getSearchCount(query);
-    console.log(`  stars:${lo}..${hi} → ${count} repos`);
-    await sleep(600);
-
-    if (count <= 1000) {
-      ranges.push({ stars: `${lo}..${hi}`, count, query });
-      return;
-    }
-
-    if (lo === hi) {
-      // Can't split further, fetch what we can
-      console.log(`    ⚠ stars:${lo} still has ${count} repos, fetching max 1,000`);
-      ranges.push({ stars: `${lo}..${hi}`, count, query });
-      return;
-    }
-
-    const mid = Math.floor((lo + hi) / 2);
-    await splitByStars(lo, mid);
-    await splitByStars(mid + 1, hi);
+  // One range per star count: 10..10, 11..11, ..., 200..200
+  for (let s = starMin; s <= starMax; s++) {
+    const query = `stars:${s} ${baseQuery}`;
+    ranges.push({ stars: `${s}..${s}`, count: null, query });
   }
 
-  await splitByStars(starMin, starMax);
   return ranges;
 }
 
